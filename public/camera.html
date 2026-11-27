@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <title>Camera Server (WebRTC Live)</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    body { margin: 0; background: #000000; color: #f8fafc; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
+    video { width: 80%; max-width: 720px; border-radius: 16px; border: 2px solid #1d90e8; transform: scaleX(-1); background: #111827; }
+    .badge { margin-top: 16px; padding: 8px 18px; border-radius: 999px; background: #111827; border: 1px solid #374151; font-size: 0.9rem; }
+    .flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity 0.15s; }
+  </style>
+</head>
+<body>
+  <div id="flash" class="flash"></div>
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="hd-canvas" style="display:none;"></canvas>
+  <div id="status" class="badge">Mengaktifkan kamera laptop...</div>
+
+  <script>
+    const socket = io();
+    const video = document.getElementById('webcam');
+    const hdCanvas = document.getElementById('hd-canvas');
+    const statusEl = document.getElementById('status');
+    const flashEl = document.getElementById('flash');
+
+    let localStream = null;
+    let pc = null;
+
+    navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, frameRate: 30 }, audio: false })
+      .then(stream => {
+        localStream = stream;
+        video.srcObject = stream;
+        statusEl.textContent = '🟢 Kamera Aktif (Menunggu Kiosk terhubung...)';
+        startWebRTCStream();
+      })
+      .catch(err => {
+        statusEl.textContent = '🔴 Gagal akses kamera: ' + err.message;
+      });
+
+    async function startWebRTCStream() {
+      if (!localStream) return;
+      if (pc) pc.close();
+
+      // iceServers kosong memaksa jalur LAN lokal tercepat tanpa internet
+      pc = new RTCPeerConnection({ iceServers: [] });
+
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          socket.emit('WEBRTC_ICE', e.candidate);
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') {
+          statusEl.textContent = '⚡ WebRTC P2P Terhubung (Live 30 FPS Tanpa Delay)';
+        }
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('WEBRTC_OFFER', offer);
+    }
+
+    // Jika halaman kiosk baru dibuka/refresh, kirim ulang offer WebRTC
+    socket.on('KIOSK_READY_FOR_STREAM', () => {
+      startWebRTCStream();
+    });
+
+    socket.on('WEBRTC_ANSWER', async (answer) => {
+      if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    });
+
+    socket.on('WEBRTC_ICE', async (candidate) => {
+      if (pc) await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    });
+
+    // Tangkap foto HD saat kiosk memberi perintah jepret
+    socket.on('CAPTURE_NOW', (poseIndex) => {
+      flashEl.style.opacity = '0.9';
+      setTimeout(() => flashEl.style.opacity = '0', 150);
+
+      hdCanvas.width = video.videoWidth || 1280;
+      hdCanvas.height = video.videoHeight || 720;
+      const ctx = hdCanvas.getContext('2d');
+
+      ctx.translate(hdCanvas.width, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, 0, 0, hdCanvas.width, hdCanvas.height);
+
+      const base64Image = hdCanvas.toDataURL('image/jpeg', 0.9);
+      socket.emit('PHOTO_CAPTURED', { poseIndex, base64Image });
+      statusEl.textContent = `📸 Pose ${poseIndex + 1} berhasil dijepret!`;
+    });
+  </script>
+</body>
+</html>
