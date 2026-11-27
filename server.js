@@ -14,6 +14,7 @@ const PORT = 3000;
 const IP_LAPTOP = "192.168.140.45";
 const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzGbqVnAZreFC6Fz2dCg4UIJJv4a4fjuYI9J3VNTEwGFN-lmUOP5-ODl4SboUyvAS27Sw/exec';
 const CAPTURE_DIR = path.join(__dirname, 'captures');
+const TEMPLATE_PATH = path.join(__dirname, 'frame_template.png');
 
 if (!fs.existsSync(CAPTURE_DIR)) {
   fs.mkdirSync(CAPTURE_DIR);
@@ -76,10 +77,10 @@ async function postToGAS(payloadObj) {
 }
 
 async function buildPhotoStrip(photoBuffers) {
-  const stripWidth = 600;
-  const stripHeight = 1500;
-  const slotW = 520;
-  const slotH = 390;
+  const stripWidth = 1200;
+  const stripHeight = 3000;
+  const slotW = 1040;
+  const slotH = 780;
 
   for (let i = 0; i < 3; i++) {
     if (!photoBuffers[i]) {
@@ -87,27 +88,47 @@ async function buildPhotoStrip(photoBuffers) {
     }
   }
 
+  // 1. Ubah ukuran 3 foto peserta agar pas dengan slot bingkai (1040 x 780 px)
   const resizedPoses = await Promise.all(
     [photoBuffers[0], photoBuffers[1], photoBuffers[2]].map(buf =>
       sharp(buf).resize(slotW, slotH, { fit: 'cover' }).toBuffer()
     )
   );
 
-  const safeKupon = escapeXml(activeSession.kupon || 'SESI');
-  const safeNama = escapeXml(activeSession.nama || 'Peserta');
+  // 2. Susun lapisan dasar (Foto 1, Foto 2, Foto 3)
+  const layers = [
+    { input: resizedPoses[0], left: 80, top: 80 },
+    { input: resizedPoses[1], left: 80, top: 940 },
+    { input: resizedPoses[2], left: 80, top: 1800 }
+  ];
 
-  const footerSvg = Buffer.from(`
-    <svg width="${stripWidth}" height="${stripHeight}">
-      <rect width="100%" height="100%" fill="none"/>
-      <text x="50%" y="1385" font-family="sans-serif" font-size="28" font-weight="bold" fill="#0f172a" text-anchor="middle">
-        PHOTOBOOTH EVENT 2026
-      </text>
-      <text x="50%" y="1425" font-family="sans-serif" font-size="18" fill="#64748b" text-anchor="middle">
-        ${safeKupon} • ${safeNama}
-      </text>
-    </svg>
-  `);
+  // 3. Timpa dengan desain kustom frame_template.png (jika tersedia), atau gunakan teks default
+  if (fs.existsSync(TEMPLATE_PATH)) {
+    const templateBuffer = await sharp(TEMPLATE_PATH)
+      .resize(stripWidth, stripHeight)
+      .toBuffer();
 
+    layers.push({ input: templateBuffer, left: 0, top: 0 });
+  } else {
+    const safeKupon = escapeXml(activeSession.kupon || 'SESI');
+    const safeNama = escapeXml(activeSession.nama || 'Peserta');
+
+    const fallbackFooterSvg = Buffer.from(`
+      <svg width="${stripWidth}" height="${stripHeight}">
+        <rect width="100%" height="100%" fill="none"/>
+        <text x="50%" y="2770" font-family="sans-serif" font-size="54" font-weight="bold" fill="#0f172a" text-anchor="middle">
+          PHOTOBOOTH EVENT 2026
+        </text>
+        <text x="50%" y="2850" font-family="sans-serif" font-size="36" fill="#64748b" text-anchor="middle">
+          ${safeKupon} • ${safeNama}
+        </text>
+      </svg>
+    `);
+
+    layers.push({ input: fallbackFooterSvg, left: 0, top: 0 });
+  }
+
+  // 4. Gabungkan seluruh lapisan menjadi file JPEG resolusi penuh
   return await sharp({
     create: {
       width: stripWidth,
@@ -116,18 +137,13 @@ async function buildPhotoStrip(photoBuffers) {
       background: { r: 255, g: 255, b: 255 }
     }
   })
-    .composite([
-      { input: resizedPoses[0], left: 40, top: 40 },
-      { input: resizedPoses[1], left: 40, top: 470 },
-      { input: resizedPoses[2], left: 40, top: 900 },
-      { input: footerSvg, left: 0, top: 0 }
-    ])
-    .jpeg({ quality: 82 })
+    .composite(layers)
+    .jpeg({ quality: 88 })
     .toBuffer();
 }
 
 io.on('connection', (socket) => {
-  // Jalur Signaling WebRTC (hanya saat inisiasi koneksi video P2P)
+  // Jalur Signaling WebRTC
   socket.on('KIOSK_READY_FOR_STREAM', () => socket.broadcast.emit('KIOSK_READY_FOR_STREAM'));
   socket.on('WEBRTC_OFFER', (offer) => socket.broadcast.emit('WEBRTC_OFFER', offer));
   socket.on('WEBRTC_ANSWER', (answer) => socket.broadcast.emit('WEBRTC_ANSWER', answer));
@@ -189,11 +205,17 @@ io.on('connection', (socket) => {
         )
       );
 
+      // Kompres ringan strip final khusus untuk payload upload agar tetap cepat (< 500 KB)
+      const compressedStrip = await sharp(stripBuffer)
+        .resize(800, 2000, { fit: 'inside' })
+        .jpeg({ quality: 82 })
+        .toBuffer();
+
       const filesPayload = [
         {
           fileName: '00_PhotoStrip_Final.jpg',
           mimeType: 'image/jpeg',
-          base64Data: stripBuffer.toString('base64')
+          base64Data: compressedStrip.toString('base64')
         },
         ...compressedPoses
       ];
@@ -211,7 +233,7 @@ io.on('connection', (socket) => {
         console.log('Berhasil upload ke GDrive:', result.folderUrl);
         io.emit('SESSION_COMPLETED', {
           folderUrl: result.folderUrl,
-          stripBase64: 'data:image/jpeg;base64,' + stripBuffer.toString('base64')
+          stripBase64: 'data:image/jpeg;base64,' + compressedStrip.toString('base64')
         });
       } else {
         console.error('Respon tidak terduga dari GAS:', typeof result === 'string' ? result.slice(0, 500) : result);
